@@ -630,6 +630,12 @@ std::tuple<Tensor, Tensor, std::vector<Tensor>> moe_permute_topK_op(
 #ifdef ENABLE_BF16
     case at::ScalarType::BFloat16:
     {
+        // Environment variable: PERMUTE_COMPUTE_DTYPE
+        // Controls the compute data type used for BFloat16 input tensors in the permute kernel.
+        // Valid values:
+        //   "fp32" - Use float32 (higher precision) for compute, even if input/output is bfloat16.
+        //   (unset or any other value) - Use bfloat16 for compute (default).
+        // Set this variable to "fp32" if you want to improve numerical accuracy at the cost of performance.
         static const char* permute_compute_dtype_env = std::getenv("PERMUTE_COMPUTE_DTYPE");
 
         using dType = cutlass::bfloat16_t;
