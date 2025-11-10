@@ -5,7 +5,6 @@
  ************************************************************************/
 
 #include "permute.h"
-#include <string>
 #include <string.h>
 
 #include <torch/torch.h>
