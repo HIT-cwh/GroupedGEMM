@@ -5,6 +5,8 @@
  ************************************************************************/
 
 #include "permute.h"
+#include <string>
+#include <string.h>
 
 #include <torch/torch.h>
 #include <cub/cub.cuh>
@@ -367,16 +369,32 @@ void moe_permute_topK_kernel_launcher(
 
             if (num_topK == 1)
             {
-                moe_permute_topK_kernel<T, T, kElementsPerAccess, 1, false><<<blocks, threads, 0, stream>>>(
-                    input,
-                    input_fwd,
-                    output,
-                    prob,
-                    prob_grad,
-                    row_id_map,
-                    num_rows,
-                    num_topK,
-                    num_cols);
+                if (prob == nullptr)
+                {
+                    moe_permute_topK_kernel<T, T, kElementsPerAccess, 1, false><<<blocks, threads, 0, stream>>>(
+                        input,
+                        input_fwd,
+                        output,
+                        prob,
+                        prob_grad,
+                        row_id_map,
+                        num_rows,
+                        num_topK,
+                        num_cols);
+                }
+                else
+                {
+                    moe_permute_topK_kernel<T, TCompute, kElementsPerAccess, 1, true><<<blocks, threads, smem_bytes, stream>>>(
+                        input,
+                        input_fwd,
+                        output,
+                        prob,
+                        prob_grad,
+                        row_id_map,
+                        num_rows,
+                        num_topK,
+                        num_cols);
+                }
             }
             else if (num_topK <= 8)
             {
@@ -456,7 +474,7 @@ void moe_permute_topK_kernel_launcher(
         size_t smem_bytes = num_topK * sizeof(TCompute);
 
 
-        if (num_topK == 1)
+        if (num_topK == 1 && prob == nullptr)
         {
             // permute_topK bwd with topK==1
             moe_recover_topK_kernel<T, T, kElementsPerAccess, false><<<blocks, threads, smem_bytes, stream>>>(
@@ -612,25 +630,43 @@ std::tuple<Tensor, Tensor, std::vector<Tensor>> moe_permute_topK_op(
 #ifdef ENABLE_BF16
     case at::ScalarType::BFloat16:
     {
-        using dType = cutlass::bfloat16_t;
-        using dTypeCompute = cutlass::bfloat16_t;
+        static const char* permute_compute_dtype_env = std::getenv("PERMUTE_COMPUTE_DTYPE");
 
+        using dType = cutlass::bfloat16_t;
         dType *input_ptr = get_ptr<dType>(input);
         dType *permuted_output_ptr = get_ptr<dType>(permuted_output);
 
-        moe_permute_topK_kernel_launcher<dType, dTypeCompute, true, 8>(
-            input_ptr,
-            permuted_output_ptr,
-            sorted_row_id_ptr,
-            row_id_map_ptr,
-            nullptr,
-            num_tokens,
-            num_topK,
-            num_cols,
-            num_out_tokens,
-            stream,
-            num_negative_one_in_indices);
+        if (permute_compute_dtype_env != nullptr && strcmp(permute_compute_dtype_env, "fp32") == 0){
+            using dTypeCompute = float;
 
+            moe_permute_topK_kernel_launcher<dType, dTypeCompute, true, 8>(
+                input_ptr,
+                permuted_output_ptr,
+                sorted_row_id_ptr,
+                row_id_map_ptr,
+                nullptr,
+                num_tokens,
+                num_topK,
+                num_cols,
+                num_out_tokens,
+                stream,
+                num_negative_one_in_indices);
+        } else {
+            using dTypeCompute = cutlass::bfloat16_t;
+
+            moe_permute_topK_kernel_launcher<dType, dTypeCompute, true, 8>(
+                input_ptr,
+                permuted_output_ptr,
+                sorted_row_id_ptr,
+                row_id_map_ptr,
+                nullptr,
+                num_tokens,
+                num_topK,
+                num_cols,
+                num_out_tokens,
+                stream,
+                num_negative_one_in_indices);
+        }
         break;
     }
 #endif
@@ -764,23 +800,39 @@ Tensor moe_recover_topK_op(
 #ifdef ENABLE_BF16
     case at::ScalarType::BFloat16:
     {
-        using dType = cutlass::bfloat16_t;
-        using dTypeCompute = cutlass::bfloat16_t;
+        static const char* permute_compute_dtype_env = std::getenv("PERMUTE_COMPUTE_DTYPE");
 
+        using dType = cutlass::bfloat16_t;
         dType *input_ptr = get_ptr<dType>(input);
         dType *unpermuted_output_ptr = get_ptr<dType>(unpermuted_output);
 
-        moe_permute_topK_kernel_launcher<dType, dTypeCompute, false, 8>(
-            input_ptr,
-            unpermuted_output_ptr,
-            nullptr,
-            row_id_map_ptr,
-            prob_ptr,
-            num_tokens,
-            num_topK,
-            num_cols,
-            0,
-            stream);
+        if (permute_compute_dtype_env != nullptr && strcmp(permute_compute_dtype_env, "fp32") == 0){
+            using dTypeCompute = float;
+            moe_permute_topK_kernel_launcher<dType, dTypeCompute, false, 8>(
+                input_ptr,
+                unpermuted_output_ptr,
+                nullptr,
+                row_id_map_ptr,
+                prob_ptr,
+                num_tokens,
+                num_topK,
+                num_cols,
+                0,
+                stream);
+        } else{
+            using dTypeCompute = cutlass::bfloat16_t;
+            moe_permute_topK_kernel_launcher<dType, dTypeCompute, false, 8>(
+                input_ptr,
+                unpermuted_output_ptr,
+                nullptr,
+                row_id_map_ptr,
+                prob_ptr,
+                num_tokens,
+                num_topK,
+                num_cols,
+                0,
+                stream);
+        }
 
         break;
     }
@@ -921,26 +973,44 @@ std::tuple<Tensor, Tensor> moe_recover_topK_bwd_op(
     case at::ScalarType::BFloat16:
     {
         using dType = cutlass::bfloat16_t;
-        using dTypeCompute = cutlass::bfloat16_t;
-
         dType *input_bwd_ptr = get_ptr<dType>(input_bwd);
         dType *input_fwd_ptr = get_ptr<dType>(input_fwd);
         dType *act_grad_ptr = get_ptr<dType>(act_grad);
 
-        moe_permute_topK_kernel_launcher<dType, dTypeCompute, true, 8>(
-            input_bwd_ptr,
-            act_grad_ptr,
-            nullptr,
-            row_id_map_ptr,
-            prob_ptr,
-            num_tokens,
-            num_topK,
-            num_cols,
-            0,
-            stream,
-            0,
-            prob_grad_ptr,
-            input_fwd_ptr);
+        static const char* permute_compute_dtype_env = std::getenv("PERMUTE_COMPUTE_DTYPE");
+        if (permute_compute_dtype_env != nullptr && strcmp(permute_compute_dtype_env, "fp32") == 0){
+            using dTypeCompute = float;
+            moe_permute_topK_kernel_launcher<dType, dTypeCompute, true, 8>(
+                input_bwd_ptr,
+                act_grad_ptr,
+                nullptr,
+                row_id_map_ptr,
+                prob_ptr,
+                num_tokens,
+                num_topK,
+                num_cols,
+                0,
+                stream,
+                0,
+                prob_grad_ptr,
+                input_fwd_ptr);
+        } else {
+            using dTypeCompute = cutlass::bfloat16_t;
+            moe_permute_topK_kernel_launcher<dType, dTypeCompute, true, 8>(
+                input_bwd_ptr,
+                act_grad_ptr,
+                nullptr,
+                row_id_map_ptr,
+                prob_ptr,
+                num_tokens,
+                num_topK,
+                num_cols,
+                0,
+                stream,
+                0,
+                prob_grad_ptr,
+                input_fwd_ptr);
+        } 
 
         break;
     }
