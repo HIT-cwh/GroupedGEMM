@@ -825,7 +825,7 @@ Tensor moe_recover_topK_op(
                 num_cols,
                 0,
                 stream);
-        } else{
+        } else {
             using dTypeCompute = cutlass::bfloat16_t;
             moe_permute_topK_kernel_launcher<dType, dTypeCompute, false, 8>(
                 input_ptr,
