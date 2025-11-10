@@ -1016,7 +1016,7 @@ std::tuple<Tensor, Tensor> moe_recover_topK_bwd_op(
                 0,
                 prob_grad_ptr,
                 input_fwd_ptr);
-        } 
+        }
 
         break;
     }
