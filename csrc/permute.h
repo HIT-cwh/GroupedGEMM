@@ -27,6 +27,14 @@ torch::Tensor moe_recover_topK_op(
     int64_t num_tokens,
     int64_t num_topK);
 
+torch::Tensor moe_recover_topK_op_inplace(
+    torch::Tensor  input,
+    torch::Tensor  output,
+    torch::Tensor  row_id_map,
+    torch::Tensor  prob_opt,
+    int64_t num_tokens,
+    int64_t num_topK);
+
 std::tuple<torch::Tensor, torch::Tensor> moe_recover_topK_bwd_op(
     Tensor  input_bwd,
     Tensor  input_fwd,

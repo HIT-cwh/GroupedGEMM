@@ -11,6 +11,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sinkhorn", &sinkhorn, "Sinkhorn kernel");
   m.def("permute", &moe_permute_topK_op, "Token permutation kernel");
   m.def("unpermute", &moe_recover_topK_op, "Token un-permutation kernel");
+  m.def("unpermute_inplace", &moe_recover_topK_op_inplace, "Token un-permutation kernel with output being inplaced");
   m.def("unpermute_bwd", &moe_recover_topK_bwd_op, "Token un-permutation backward kernel");
 }
 

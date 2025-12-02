@@ -43,6 +43,9 @@ def permute(input, indices, num_out_tokens, workspace, max_expanded_token_num, n
 def unpermute(input, row_id_map, prob, max_tokens, num_topK):
     return backend.unpermute(input, row_id_map, prob, max_tokens, num_topK)
 
+def unpermute_inplace(input, output, row_id_map, prob, max_tokens, num_topK):
+    return backend.unpermute_inplace(input, output, row_id_map, prob, max_tokens, num_topK)
+
 def unpermute_bwd(input_bwd, input_fwd, row_id_map, prob):
     # TODO: @Jiang fix the case in kernel to allow None probs
     if prob is None:
