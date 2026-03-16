@@ -43,7 +43,9 @@ if os.environ.get("GROUPED_GEMM_CUTLASS", "0") == "1":
 ext_modules = [
     CUDAExtension(
         "grouped_gemm_backend",
-        ["csrc/ops.cu", "csrc/grouped_gemm.cu", "csrc/sinkhorn.cu", "csrc/permute.cu"],
+        # modified
+        # ["csrc/ops.cu", "csrc/grouped_gemm.cu", "csrc/sinkhorn.cu", "csrc/permute.cu"],
+        ["csrc/ops.cu", "csrc/grouped_gemm.cu", "csrc/sinkhorn.cu", "csrc/permute_128x.cu"],
         include_dirs = [
             f"{cwd}/third_party/cutlass/include/"
         ],
