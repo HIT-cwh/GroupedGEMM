@@ -171,6 +171,9 @@ static __global__ void scatter_row_id_map_from_padded_sorted_row_id_ub(
 //     }
 // }
 
+// Grid: <<<E, threads>>>
+// Each block handles one expert's padding rows (at most 127 rows) via an inner loop.
+// Previous version used dim3(E, 128) — 128x more blocks, most returning immediately.
 template <typename T, int kElementsPerAccess>
 static __global__ void zero_pad_by_segments_kernel(
     T* __restrict__ output,             // [num_out_tokens_padded, num_cols]
@@ -184,35 +187,33 @@ static __global__ void zero_pad_by_segments_kernel(
     int e = blockIdx.x;
     if (e >= E) return;
 
-    int out_start = offsets[e];
-    int out_end   = offsets[e + 1];
-    int pad_start = out_start + counts[e];
-
-    int pad_rows = out_end - pad_start;
+    int pad_start = offsets[e] + counts[e];
+    int pad_rows  = offsets[e + 1] - pad_start;
     if (pad_rows <= 0) return;
-
-    // 2D mapping:
-    // blockIdx.y selects which padded row within the segment
-    int r = blockIdx.y;
-    if (r >= pad_rows) return;
-
-    int row = pad_start + r;
 
     int tid = threadIdx.x;
     int64_t num_cols_i64 = (int64_t)num_cols;
-    T* row_ptr = output + (int64_t)row * num_cols_i64;
 
     Frag z;
     #pragma unroll
     for (int i = 0; i < kElementsPerAccess; ++i) z[i] = T(0);
 
-    for (int c = tid * kElementsPerAccess; c < num_cols; c += blockDim.x * kElementsPerAccess) {
-        *(float4*)(row_ptr + c) = *(float4*)(z.data());
+    for (int r = 0; r < pad_rows; ++r) {
+        T* row_ptr = output + (int64_t)(pad_start + r) * num_cols_i64;
+        for (int c = tid * kElementsPerAccess; c < num_cols;
+             c += blockDim.x * kElementsPerAccess) {
+            *(float4*)(row_ptr + c) = *(float4*)(z.data());
+        }
     }
 }
 
-// NEW: zero UB tail [offsets[E], ub_total) with a 1D grid, on GPU (no CPU sync).
-// This is separate from per-expert padding zeroing to avoid launching many empty blocks.
+// Zero UB tail [offsets[E], ub_total) with a 1D grid, on GPU (no CPU sync).
+// Grid is sized for the worst-case tail (max_tail_rows), NOT the entire UB buffer.
+// Previous version used grid = ceil(ub_total * vec_cols / 256) — indexed from output[0],
+// causing ~67-99% of blocks to read offsets[E] and return immediately.
+// New version: thread idx directly maps to tail-relative position.
+// Grid: <<<ceil(max_tail_rows * vec_cols / threads), threads>>>
+//   where max_tail_rows = 128*E (CPU-known upper bound for tail length).
 template <typename T, int kElementsPerAccess>
 static __global__ void zero_ub_tail_kernel(
     T* __restrict__ output,           // [ub_total, num_cols]
@@ -222,21 +223,20 @@ static __global__ void zero_ub_tail_kernel(
     int ub_total)
 {
     int64_t num_cols_i64 = (int64_t)num_cols;
+    int64_t vec_cols = num_cols_i64 / kElementsPerAccess;
 
     int tail_start = offsets[E];
     if (tail_start >= ub_total) return;
 
-    int64_t total_elems = (int64_t)(ub_total - tail_start) * num_cols_i64;
+    int64_t tail_rows = (int64_t)(ub_total - tail_start);
+    int64_t total_vec = tail_rows * vec_cols;
 
-    // vectorized store granularity (same as main kernels): kElementsPerAccess scalars == 16 bytes for fp16/bf16 (8),
-    // and 16 bytes for fp32 (4). We assume num_cols is multiple of kElementsPerAccess.
-    int64_t total_vec = total_elems / kElementsPerAccess;
-
+    // idx is relative to the tail start, NOT output[0]
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_vec) return;
 
-    int64_t base_elem = ((int64_t)tail_start * num_cols_i64) + idx * kElementsPerAccess;
-    T* dst = output + base_elem;
+    int64_t abs_elem = (int64_t)tail_start * num_cols_i64 + idx * kElementsPerAccess;
+    T* dst = output + abs_elem;
 
     using Frag = cutlass::Array<T, kElementsPerAccess>;
     Frag z;
@@ -1137,32 +1137,31 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, std::vector<Tensor>> moe_permute_topK
             num_topK,
             num_cols);
 
-        // (1) zero true per-expert padding tails (cheap, no wasted work)
-        // pad_rows per expert <= 127 always when align=128, so fix grid.y=128
-        dim3 grid(E, 128, 1);
-        int z_threads = std::min(num_cols / 4, 1024);
-        zero_pad_by_segments_kernel<dType, 4><<<grid, z_threads, 0, stream>>>(
-            permuted_output_ptr,
-            expert_counts_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols);
-        
-        // (2) zero UB tail [offsets[E], UB) (also cheap, only touches tail)
-        int zthreads = 256;
-        int64_t vec_cols = (int64_t)num_cols / 4;
-        // total vectors = (UB - tail_start) * (num_cols/4)
-        // we don't know tail_start on CPU; kernel reads offsets[E].
-        // Launch enough blocks for worst-case tail: (UB * num_cols/4). kernel guards via idx>=total_vec.
-        int64_t total_vec_ub = (int64_t)num_out_tokens_ub * vec_cols;
-        int blocks_tail = (int)((total_vec_ub + zthreads - 1) / zthreads);
+        // (1) zero per-expert padding tails — one block per expert, loop over ≤127 pad rows
+        {
+            int z_threads = std::min(num_cols / 4, 1024);
+            zero_pad_by_segments_kernel<dType, 4><<<E, z_threads, 0, stream>>>(
+                permuted_output_ptr,
+                expert_counts_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols);
+        }
 
-        zero_ub_tail_kernel<dType, 4><<<blocks_tail, zthreads, 0, stream>>>(
-            permuted_output_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols,
-            (int)num_out_tokens_ub);
+        // (2) zero UB tail — grid sized for worst-case tail (128*E rows), not entire UB
+        {
+            int zthreads = 256;
+            int64_t vec_cols = (int64_t)num_cols / 4;
+            int64_t max_tail_vec = (int64_t)kAlignTokens * E * vec_cols;
+            int blocks_tail = (int)((max_tail_vec + zthreads - 1) / zthreads);
+
+            zero_ub_tail_kernel<dType, 4><<<blocks_tail, zthreads, 0, stream>>>(
+                permuted_output_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols,
+                (int)num_out_tokens_ub);
+        }
 
         break;
     }
@@ -1186,28 +1185,31 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, std::vector<Tensor>> moe_permute_topK
             num_cols);
 
         // (1) zero true per-expert padding tails
-        // pad_rows per expert <= 127 always when align=128, so fix grid.y=128
-        dim3 grid(E, 128, 1);
-        int z_threads = std::min(num_cols / 8, 1024);
-        zero_pad_by_segments_kernel<dType, 8><<<grid, z_threads, 0, stream>>>(
-            permuted_output_ptr,
-            expert_counts_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols);
-        
-        // (2) zero UB tail
-        int zthreads = 256;
-        int64_t vec_cols = (int64_t)num_cols / 8;
-        int64_t total_vec_ub = (int64_t)num_out_tokens_ub * vec_cols;
-        int blocks_tail = (int)((total_vec_ub + zthreads - 1) / zthreads);
+        // (1) zero per-expert padding tails
+        {
+            int z_threads = std::min(num_cols / 8, 1024);
+            zero_pad_by_segments_kernel<dType, 8><<<E, z_threads, 0, stream>>>(
+                permuted_output_ptr,
+                expert_counts_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols);
+        }
 
-        zero_ub_tail_kernel<dType, 8><<<blocks_tail, zthreads, 0, stream>>>(
-            permuted_output_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols,
-            (int)num_out_tokens_ub);
+        // (2) zero UB tail
+        {
+            int zthreads = 256;
+            int64_t vec_cols = (int64_t)num_cols / 8;
+            int64_t max_tail_vec = (int64_t)kAlignTokens * E * vec_cols;
+            int blocks_tail = (int)((max_tail_vec + zthreads - 1) / zthreads);
+
+            zero_ub_tail_kernel<dType, 8><<<blocks_tail, zthreads, 0, stream>>>(
+                permuted_output_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols,
+                (int)num_out_tokens_ub);
+        }
 
         break;
     }
@@ -1234,28 +1236,31 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, std::vector<Tensor>> moe_permute_topK
                 row_id_map_ptr, num_tokens, num_topK, num_cols);
         }
 
-        // (1) zero true per-expert padding tails
-        // pad_rows per expert <= 127 always when align=128, so fix grid.y=128
-        dim3 grid(E, 128, 1);
-        int z_threads = std::min(num_cols / 8, 1024);
-        zero_pad_by_segments_kernel<dType, 8><<<grid, z_threads, 0, stream>>>(
-            permuted_output_ptr,
-            expert_counts_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols);
-        
-        int zthreads = 256;
-        int64_t vec_cols = (int64_t)num_cols / 8;
-        int64_t total_vec_ub = (int64_t)num_out_tokens_ub * vec_cols;
-        int blocks_tail = (int)((total_vec_ub + zthreads - 1) / zthreads);
+        // (1) zero per-expert padding tails
+        {
+            int z_threads = std::min(num_cols / 8, 1024);
+            zero_pad_by_segments_kernel<dType, 8><<<E, z_threads, 0, stream>>>(
+                permuted_output_ptr,
+                expert_counts_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols);
+        }
 
-        zero_ub_tail_kernel<dType, 8><<<blocks_tail, zthreads, 0, stream>>>(
-            permuted_output_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols,
-            (int)num_out_tokens_ub);
+        // (2) zero UB tail
+        {
+            int zthreads = 256;
+            int64_t vec_cols = (int64_t)num_cols / 8;
+            int64_t max_tail_vec = (int64_t)kAlignTokens * E * vec_cols;
+            int blocks_tail = (int)((max_tail_vec + zthreads - 1) / zthreads);
+
+            zero_ub_tail_kernel<dType, 8><<<blocks_tail, zthreads, 0, stream>>>(
+                permuted_output_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols,
+                (int)num_out_tokens_ub);
+        }
 
         break;
     }
@@ -1274,29 +1279,31 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, std::vector<Tensor>> moe_permute_topK
             input_ptr, nullptr, permuted_output_ptr, nullptr, nullptr,
             row_id_map_ptr, num_tokens, num_topK, num_cols);
 
-        // (1) zero true per-expert padding tails
-        // pad_rows per expert <= 127 always when align=128, so fix grid.y=128
-        dim3 grid(E, 128, 1);
-        int z_threads = std::min(num_cols / 16, 1024);
-        zero_pad_by_segments_kernel<dType, 16><<<grid, z_threads, 0, stream>>>(
-            permuted_output_ptr,
-            expert_counts_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols);
-        
-        // (2) zero UB tail
-        int zthreads = 256;
-        int64_t vec_cols = (int64_t)num_cols / 16;
-        int64_t total_vec_ub = (int64_t)num_out_tokens_ub * vec_cols;
-        int blocks_tail = (int)((total_vec_ub + zthreads - 1) / zthreads);
+        // (1) zero per-expert padding tails
+        {
+            int z_threads = std::min(num_cols / 16, 1024);
+            zero_pad_by_segments_kernel<dType, 16><<<E, z_threads, 0, stream>>>(
+                permuted_output_ptr,
+                expert_counts_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols);
+        }
 
-        zero_ub_tail_kernel<dType, 16><<<blocks_tail, zthreads, 0, stream>>>(
-            permuted_output_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols,
-            (int)num_out_tokens_ub);
+        // (2) zero UB tail
+        {
+            int zthreads = 256;
+            int64_t vec_cols = (int64_t)num_cols / 16;
+            int64_t max_tail_vec = (int64_t)kAlignTokens * E * vec_cols;
+            int blocks_tail = (int)((max_tail_vec + zthreads - 1) / zthreads);
+
+            zero_ub_tail_kernel<dType, 16><<<blocks_tail, zthreads, 0, stream>>>(
+                permuted_output_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols,
+                (int)num_out_tokens_ub);
+        }
 
         break;
     }
@@ -1313,29 +1320,31 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, std::vector<Tensor>> moe_permute_topK
             input_ptr, nullptr, permuted_output_ptr, nullptr, nullptr,
             row_id_map_ptr, num_tokens, num_topK, num_cols);
 
-        // (1) zero true per-expert padding tails
-        // pad_rows per expert <= 127 always when align=128, so fix grid.y=128
-        dim3 grid(E, 128, 1);
-        int z_threads = std::min(num_cols / 16, 1024);
-        zero_pad_by_segments_kernel<dType, 16><<<grid, z_threads, 0, stream>>>(
-            permuted_output_ptr,
-            expert_counts_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols);
-        
-        // (2) zero UB tail
-        int zthreads = 256;
-        int64_t vec_cols = (int64_t)num_cols / 16;
-        int64_t total_vec_ub = (int64_t)num_out_tokens_ub * vec_cols;
-        int blocks_tail = (int)((total_vec_ub + zthreads - 1) / zthreads);
+        // (1) zero per-expert padding tails
+        {
+            int z_threads = std::min(num_cols / 16, 1024);
+            zero_pad_by_segments_kernel<dType, 16><<<E, z_threads, 0, stream>>>(
+                permuted_output_ptr,
+                expert_counts_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols);
+        }
 
-        zero_ub_tail_kernel<dType, 16><<<blocks_tail, zthreads, 0, stream>>>(
-            permuted_output_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols,
-            (int)num_out_tokens_ub);
+        // (2) zero UB tail
+        {
+            int zthreads = 256;
+            int64_t vec_cols = (int64_t)num_cols / 16;
+            int64_t max_tail_vec = (int64_t)kAlignTokens * E * vec_cols;
+            int blocks_tail = (int)((max_tail_vec + zthreads - 1) / zthreads);
+
+            zero_ub_tail_kernel<dType, 16><<<blocks_tail, zthreads, 0, stream>>>(
+                permuted_output_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols,
+                (int)num_out_tokens_ub);
+        }
 
         break;
     }
@@ -2164,6 +2173,7 @@ std::tuple<Tensor, Tensor> moe_recover_topK_unpad_bwd_op(
 
     // NEW: UB total rows for act_grad (same as permute UB output length)
     const int ub_total = (int)input_fwd.size(0);
+    constexpr int kAlignTokens = 128;
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -2193,22 +2203,23 @@ std::tuple<Tensor, Tensor> moe_recover_topK_unpad_bwd_op(
             prob_grad_ptr,
             input_fwd_ptr);
 
-        // (1) zero true per-expert padding rows
-        dim3 grid(E, 128, 1);
-        int z_threads = std::min(num_cols / 4, 1024);
-        zero_pad_by_segments_kernel<dType, 4><<<grid, z_threads, 0, stream>>>(
-            act_grad_ptr,
-            expert_counts_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols);
+        // (1) zero per-expert padding rows
+        {
+            int z_threads = std::min(num_cols / 4, 1024);
+            zero_pad_by_segments_kernel<dType, 4><<<E, z_threads, 0, stream>>>(
+                act_grad_ptr,
+                expert_counts_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols);
+        }
 
-        // (2) zero UB tail: [padded_offsets[E], ub_total)
+        // (2) zero UB tail
         {
             int zthreads = 256;
             int64_t vec_cols = (int64_t)num_cols / 4;
-            int64_t total_vec_ub = (int64_t)ub_total * vec_cols;
-            int blocks_tail = (int)((total_vec_ub + zthreads - 1) / zthreads);
+            int64_t max_tail_vec = (int64_t)kAlignTokens * E * vec_cols;
+            int blocks_tail = (int)((max_tail_vec + zthreads - 1) / zthreads);
 
             zero_ub_tail_kernel<dType, 4><<<blocks_tail, zthreads, 0, stream>>>(
                 act_grad_ptr,
@@ -2244,22 +2255,23 @@ std::tuple<Tensor, Tensor> moe_recover_topK_unpad_bwd_op(
             prob_grad_ptr,
             input_fwd_ptr);
 
-        // (1) zero true per-expert padding rows
-        dim3 grid(E, 128, 1);
-        int z_threads = std::min(num_cols / 8, 1024);
-        zero_pad_by_segments_kernel<dType, 8><<<grid, z_threads, 0, stream>>>(
-            act_grad_ptr,
-            expert_counts_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols);
+        // (1) zero per-expert padding rows
+        {
+            int z_threads = std::min(num_cols / 8, 1024);
+            zero_pad_by_segments_kernel<dType, 8><<<E, z_threads, 0, stream>>>(
+                act_grad_ptr,
+                expert_counts_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols);
+        }
 
         // (2) zero UB tail
         {
             int zthreads = 256;
             int64_t vec_cols = (int64_t)num_cols / 8;
-            int64_t total_vec_ub = (int64_t)ub_total * vec_cols;
-            int blocks_tail = (int)((total_vec_ub + zthreads - 1) / zthreads);
+            int64_t max_tail_vec = (int64_t)kAlignTokens * E * vec_cols;
+            int blocks_tail = (int)((max_tail_vec + zthreads - 1) / zthreads);
 
             zero_ub_tail_kernel<dType, 8><<<blocks_tail, zthreads, 0, stream>>>(
                 act_grad_ptr,
@@ -2314,22 +2326,23 @@ std::tuple<Tensor, Tensor> moe_recover_topK_unpad_bwd_op(
                 input_fwd_ptr);
         }
 
-        // (1) zero true per-expert padding rows
-        dim3 grid(E, 128, 1);
-        int z_threads = std::min(num_cols / 8, 1024);
-        zero_pad_by_segments_kernel<dType, 8><<<grid, z_threads, 0, stream>>>(
-            act_grad_ptr,
-            expert_counts_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols);
+        // (1) zero per-expert padding rows
+        {
+            int z_threads = std::min(num_cols / 8, 1024);
+            zero_pad_by_segments_kernel<dType, 8><<<E, z_threads, 0, stream>>>(
+                act_grad_ptr,
+                expert_counts_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols);
+        }
 
         // (2) zero UB tail
         {
             int zthreads = 256;
             int64_t vec_cols = (int64_t)num_cols / 8;
-            int64_t total_vec_ub = (int64_t)ub_total * vec_cols;
-            int blocks_tail = (int)((total_vec_ub + zthreads - 1) / zthreads);
+            int64_t max_tail_vec = (int64_t)kAlignTokens * E * vec_cols;
+            int blocks_tail = (int)((max_tail_vec + zthreads - 1) / zthreads);
 
             zero_ub_tail_kernel<dType, 8><<<blocks_tail, zthreads, 0, stream>>>(
                 act_grad_ptr,
@@ -2367,22 +2380,23 @@ std::tuple<Tensor, Tensor> moe_recover_topK_unpad_bwd_op(
             prob_grad_ptr,
             input_fwd_ptr);
 
-        // (1) zero true per-expert padding rows
-        dim3 grid(E, 128, 1);
-        int z_threads = std::min(num_cols / 16, 1024);
-        zero_pad_by_segments_kernel<dType, 16><<<grid, z_threads, 0, stream>>>(
-            act_grad_ptr,
-            expert_counts_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols);
+        // (1) zero per-expert padding rows
+        {
+            int z_threads = std::min(num_cols / 16, 1024);
+            zero_pad_by_segments_kernel<dType, 16><<<E, z_threads, 0, stream>>>(
+                act_grad_ptr,
+                expert_counts_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols);
+        }
 
         // (2) zero UB tail
         {
             int zthreads = 256;
             int64_t vec_cols = (int64_t)num_cols / 16;
-            int64_t total_vec_ub = (int64_t)ub_total * vec_cols;
-            int blocks_tail = (int)((total_vec_ub + zthreads - 1) / zthreads);
+            int64_t max_tail_vec = (int64_t)kAlignTokens * E * vec_cols;
+            int blocks_tail = (int)((max_tail_vec + zthreads - 1) / zthreads);
 
             zero_ub_tail_kernel<dType, 16><<<blocks_tail, zthreads, 0, stream>>>(
                 act_grad_ptr,
@@ -2418,22 +2432,23 @@ std::tuple<Tensor, Tensor> moe_recover_topK_unpad_bwd_op(
             prob_grad_ptr,
             input_fwd_ptr);
 
-        // (1) zero true per-expert padding rows
-        dim3 grid(E, 128, 1);
-        int z_threads = std::min(num_cols / 16, 1024);
-        zero_pad_by_segments_kernel<dType, 16><<<grid, z_threads, 0, stream>>>(
-            act_grad_ptr,
-            expert_counts_ptr,
-            padded_offsets_ptr,
-            E,
-            num_cols);
+        // (1) zero per-expert padding rows
+        {
+            int z_threads = std::min(num_cols / 16, 1024);
+            zero_pad_by_segments_kernel<dType, 16><<<E, z_threads, 0, stream>>>(
+                act_grad_ptr,
+                expert_counts_ptr,
+                padded_offsets_ptr,
+                E,
+                num_cols);
+        }
 
         // (2) zero UB tail
         {
             int zthreads = 256;
             int64_t vec_cols = (int64_t)num_cols / 16;
-            int64_t total_vec_ub = (int64_t)ub_total * vec_cols;
-            int blocks_tail = (int)((total_vec_ub + zthreads - 1) / zthreads);
+            int64_t max_tail_vec = (int64_t)kAlignTokens * E * vec_cols;
+            int blocks_tail = (int)((max_tail_vec + zthreads - 1) / zthreads);
 
             zero_ub_tail_kernel<dType, 16><<<blocks_tail, zthreads, 0, stream>>>(
                 act_grad_ptr,

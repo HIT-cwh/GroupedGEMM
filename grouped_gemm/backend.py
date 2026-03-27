@@ -51,3 +51,14 @@ def unpermute_bwd(input_bwd, input_fwd, row_id_map, prob):
     if prob is None:
       prob = torch.ones([input_bwd.size(0), 1], dtype=torch.float32, device=input_bwd.device)
     return backend.unpermute_bwd(input_bwd, input_fwd, row_id_map, prob)
+
+def permute_pad(input, indices, num_out_tokens, workspace, max_expanded_token_num, num_experts, num_negative_one_in_indices=0):
+    return backend.permute_pad(input, indices, num_out_tokens, workspace, num_negative_one_in_indices, max_expanded_token_num, num_experts)
+
+def unpermute_unpad(input, row_id_map, prob, num_tokens, num_topK):
+    return backend.unpermute_unpad(input, row_id_map, prob, num_tokens, num_topK)
+
+def unpermute_unpad_bwd(input_bwd, input_fwd, row_id_map, prob, expert_counts, padded_offsets):
+    if prob is None:
+      prob = torch.ones([input_bwd.size(0), 1], dtype=torch.float32, device=input_bwd.device)
+    return backend.unpermute_unpad_bwd(input_bwd, input_fwd, row_id_map, prob, expert_counts, padded_offsets)
